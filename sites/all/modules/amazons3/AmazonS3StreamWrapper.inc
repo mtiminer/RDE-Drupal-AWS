@@ -47,6 +47,11 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
   protected $objectSize = 0;
 
   /**
+   * @var string Determines whether the write buffer is active.
+   */
+  protected $write_buffer = FALSE;
+
+  /**
    * @var string Object read/write buffer, typically a file
    */
   protected $buffer = NULL;
@@ -125,16 +130,16 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
     if (variable_get('amazons3_cname', 0)) {
       $domain = variable_get('amazons3_domain', '');
       if (strlen($domain) > 0) {
-        $this->domain = '//' . $domain;
+        $this->domain = $domain;
       }
       else {
-        $this->domain = '//' . $this->bucket;
+        $this->domain = $this->bucket;
       }
 
       $this->cloudfront = variable_get('amazons3_cloudfront', TRUE);
     }
     else {
-      $this->domain = '//' . $this->bucket . '.s3.amazonaws.com';
+      $this->domain = $this->bucket . '.s3.amazonaws.com';
     }
 
     // Check whether local file caching is turned on.
@@ -218,6 +223,7 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
    *   Returns a string containing a web accessible URL for the resource.
    */
   public function getExternalUrl() {
+    global $is_https;
 
     // Image styles support
     // Delivers the first request to an image from the private file system
@@ -280,7 +286,7 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
     $response = is_array($info['response']) ? $info['response'] : array();
 
     // Generate the URL.
-    $url = $this->domain . '/' . $local_path;
+    $url = $this->domain . '/' . drupal_encode_path($local_path);
 
     if ($info['presigned_url'] && $this->cloudfront) {
       $url = $this->getCF()->get_private_object_url($this->domain, $local_path, $timeout, array('Secure' => $info['https']));
@@ -297,8 +303,11 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
         )
       );
     }
-    elseif ($info['https']) {
-      $url = 'https:' . $url;
+    elseif ($info['https'] || $is_https) {
+      $url = 'https://' . $url;
+    }
+    else {
+      $url = 'http://' . $url;
     }
 
     return $url;
@@ -492,14 +501,21 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
         $opts = array(
           'range' => $this->position . '-' . $range_end,
         );
-        $response = $this->getS3()->get_object($this->bucket, $this->getLocalPath($this->uri), $opts);
-        if ($response->isOK()) {
-          $this->buffer .= $response->body;
-          $this->bufferLength += strlen($response->body);
+        try {
+          $response = $this->getS3()
+            ->get_object($this->bucket, $this->getLocalPath($this->uri), $opts);
+          if ($response->isOK()) {
+            $this->buffer .= $response->body;
+            $this->bufferLength += strlen($response->body);
+
+            $data = substr($response->body, 0, min($count, $this->objectSize));
+            $this->position += strlen($data);
+          }
+        }
+        catch (Exception $e) {
+          watchdog('amazons3', 'Unable to read @uri', array('@uri' => $this->uri), WATCHDOG_NOTICE);
         }
       }
-      $data = substr($response->body, 0, min($count, $this->objectSize));
-      $this->position += strlen($data);
     }
     return $data;
   }
@@ -589,30 +605,42 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
    */
   public function stream_flush() {
     if ($this->write_buffer) {
-      // Set the storage type.
-      $s3_storage_type = AmazonS3::STORAGE_STANDARD;
-      $local_path = $this->getLocalPath();
-      foreach ($this->rrs as $path) {
-        if (preg_match('#' . strtr($path, '#', '\#') . '#', $local_path)) {
-          $s3_storage_type = AmazonS3::STORAGE_REDUCED;
-          break;
+      try {
+        // Make sure the S3 class is loaded.
+        $this->getS3();
+        // Set the storage type.
+        $s3_storage_type = AmazonS3::STORAGE_STANDARD;
+        $local_path = $this->getLocalPath();
+        foreach ($this->rrs as $path) {
+          if (preg_match('#' . strtr($path, '#', '\#') . '#', $local_path)) {
+            $s3_storage_type = AmazonS3::STORAGE_REDUCED;
+            break;
+          }
+        }
+
+        // Set the metadata.
+        $headers = array();
+        $headers = array_merge($headers, module_invoke_all('amazons3_save_headers', $local_path, $headers));
+
+        // Save the object.
+        $response = $this->getS3()
+          ->create_object($this->bucket, $local_path, array(
+            'body' => $this->buffer,
+            'acl' => AmazonS3::ACL_PUBLIC,
+            'contentType' => AmazonS3StreamWrapper::getMimeType($this->uri),
+            'storage' => $s3_storage_type,
+            'headers' => $headers,
+          ));
+        if ($response->isOK()) {
+          // Delete cache entry.
+          db_delete('amazons3_file')
+            ->condition('uri', $this->uri)
+            ->execute();
+          return TRUE;
         }
       }
-
-      // Set the metadata.
-      $headers = array();
-      $headers = array_merge($headers, module_invoke_all('amazons3_save_headers', $local_path, $headers));
-
-      // Save the object.
-      $response = $this->getS3()->create_object($this->bucket, $local_path, array(
-        'body' => $this->buffer,
-        'acl' => AmazonS3::ACL_PUBLIC,
-        'contentType' => AmazonS3StreamWrapper::getMimeType($this->uri),
-        'storage' => $s3_storage_type,
-        'headers' => $headers,
-      ));
-      if ($response->isOK()) {
-        return TRUE;
+      catch (Exception $e) {
+        watchdog('amazons3', 'Unable to write file @path', array('@path' => $local_path), WATCHDOG_NOTICE);
       }
     }
     $this->clearBuffer();
@@ -657,13 +685,19 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
    */
   public function unlink($uri) {
     $this->assertConstructorCalled();
-    $response = $this->getS3()->delete_object($this->bucket, $this->getLocalPath($uri));
-    if ($response->isOK()) {
-      // Delete from cache.
-      db_delete('amazons3_file')
-        ->condition('uri', $uri)
-        ->execute();
-      return TRUE;
+    try {
+      $response = $this->getS3()
+        ->delete_object($this->bucket, $this->getLocalPath($uri));
+      if ($response->isOK()) {
+        // Delete from cache.
+        db_delete('amazons3_file')
+          ->condition('uri', $uri)
+          ->execute();
+        return TRUE;
+      }
+    }
+    catch (Exception $e) {
+      watchdog('amazons3', 'Unable to delete @uri', array('@uri' => $uri), WATCHDOG_NOTICE);
     }
     return FALSE;
   }
@@ -688,16 +722,24 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
     $this->assertConstructorCalled();
     $from = $this->getLocalPath($from_uri);
     $to = $this->getLocalPath($to_uri);
-    $s3 = $this->getS3();
 
-    $response = $s3->copy_object(
-      array('bucket' => $this->bucket, 'filename' => $from),
-      array('bucket' => $this->bucket, 'filename' => $to),
-      array('acl' => AmazonS3::ACL_PUBLIC)
-    );
+    try {
+      $s3 = $this->getS3();
 
-    // Check the response and then remove the original.
-    return $response->isOK() && $this->unlink($from_uri);
+      $response = $s3->copy_object(
+        array('bucket' => $this->bucket, 'filename' => $from),
+        array('bucket' => $this->bucket, 'filename' => $to),
+        array('acl' => AmazonS3::ACL_PUBLIC)
+      );
+
+      // Check the response and then remove the original.
+      return $response->isOK() && $this->unlink($from_uri);
+    }
+    catch (Exception $e) {
+      watchdog('amazons3', 'Unable to copy file from @from to @to', array('@from' => $from, '@to' => $to), WATCHDOG_NOTICE);
+    }
+
+    return FALSE;
   }
 
   /**
@@ -749,9 +791,15 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
 
     // s3 has no concept of directories, but we emulate it by creating an
     // object of size 0 with a trailing "/"
-    $response = $this->getS3()->create_object($this->bucket, $localpath . '/', array('body' => ''));
-    if ($response->isOk()) {
-      return TRUE;
+    try {
+      $response = $this->getS3()
+        ->create_object($this->bucket, $localpath . '/', array('body' => ''));
+      if ($response->isOk()) {
+        return TRUE;
+      }
+    }
+    catch (Exception $e) {
+      watchdog('amazons3', 'Unable to create directory @path', array('@path' => $localpath), WATCHDOG_NOTICE);
     }
     return FALSE;
   }
@@ -769,50 +817,69 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
    * @see http://php.net/manual/en/streamwrapper.rmdir.php
    */
   public function rmdir($uri, $options) {
-    return $this->amazons3_rmdir($uri, $options);
+    return $this->_amazons3_rmdir($uri, $options);
   }
   /**
    * Helper function for deleting directories.
    *
    * The force flag will perform a recursive delete.
    */
-  public function amazons3_rmdir($uri, $options, $force = FALSE) {
+  public function _amazons3_rmdir($uri, $options, $force = FALSE) {
     $this->assertConstructorCalled();
     $localpath = $this->getLocalPath($uri);
-    $s3 = $this->getS3();
 
-    if ($force) {
-      $objects = $s3->get_object_list($this->bucket, array('prefix' => $localpath));
-      if (gettype($objects) === 'array' && !empty($objects)) {
-        $or = db_or();
-        foreach ($objects as $object) {
-          $s3->batch()->delete_object($this->bucket, $object);
-          // Delete from cache.
-          $object_uri = 's3://' . rtrim($object, '/');
-          $or->condition('uri', $object_uri, '=');
+    try {
+      $s3 = $this->getS3();
+
+      if ($force) {
+        $objects = $s3->get_object_list($this->bucket, array('prefix' => $localpath));
+        if (gettype($objects) === 'array' && !empty($objects)) {
+          $or = db_or();
+          foreach ($objects as $object) {
+            $s3->batch()->delete_object($this->bucket, $object);
+            // Delete from cache.
+            $object_uri = 's3://' . rtrim($object, '/');
+            $or->condition('uri', $object_uri, '=');
+          }
+          db_delete('amazons3_file')->condition($or)->execute();
+          $responses = $s3->batch()->send();
+
+          if ($responses->areOK()) {
+            return TRUE;
+          }
         }
-        db_delete('amazons3_file')->condition($or)->execute();
-        $responses = $s3->batch()->send();
-
-        if ($responses->areOK()) {
-          return TRUE;
+      }
+      else {
+        $objects = $s3->get_object_list($this->bucket, array(
+          'prefix' => $localpath,
+          'max-keys' => 2
+        ));
+        if (count($objects) === 1) {
+          $response = $this->getS3()->delete_object($this->bucket, $localpath);
+          $response2 = $this->getS3()
+            ->delete_object($this->bucket, $localpath . '/');
+          if ($response->isOK() || $response2->isOK()) {
+            // Delete from cache.
+            db_delete('amazons3_file')
+              ->condition('uri', $uri)
+              ->execute();
+            return TRUE;
+          }
+        }
+        else {
+          if (count($objects) === 0) {
+            db_delete('amazons3_file')
+              ->condition('uri', $uri)
+              ->execute();
+            return TRUE;
+          }
         }
       }
     }
-    else {
-      $objects = $s3->get_object_list($this->bucket, array('prefix' => $localpath, 'max-keys' => 2));
-      if (count($objects) === 1) {
-        $response = $this->getS3()->delete_object($this->bucket, $localpath);
-        $response2 = $this->getS3()->delete_object($this->bucket, $localpath . '/');
-        if ($response->isOK() || $response2->isOK()) {
-          // Delete from cache.
-          db_delete('amazons3_file')
-            ->condition('uri', $uri)
-            ->execute();
-          return TRUE;
-        }
-      }
+    catch (Exception $e) {
+      watchdog('amazons3', 'Unable to delete directory @path', array('@path' => $localpath), WATCHDOG_NOTICE);
     }
+
     return FALSE;
   }
 
@@ -848,7 +915,7 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
    *
    * @see http://php.net/manual/en/streamwrapper.dir-opendir.php
    */
-  public function dir_opendir($uri, $options) {
+  public function dir_opendir($uri, $options = array()) {
     $this->assertConstructorCalled();
     if ($uri === NULL) {
       return FALSE;
@@ -870,50 +937,57 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
     $prefix_length = strlen($prefix);
 
     while ($truncated) {
-      $response = $this->getS3()->list_objects($this->bucket, array(
+      try {
+        $response = $this->getS3()->list_objects($this->bucket, array(
           'delimiter' => '/',
           'prefix' => $prefix,
           'marker' => urlencode($marker),
-      ));
-      if ($response->isOK()) {
+        ));
+        if ($response->isOK()) {
 
-        $this->dir[] = '.';
-        $this->dir[] = '..';
+          $this->dir[] = '.';
+          $this->dir[] = '..';
 
-        // Folders.
-        if (isset($response->body->CommonPrefixes)) {
-          foreach ($response->body->CommonPrefixes as $prefix) {
-            $marker = substr($prefix->Prefix, $prefix_length, strlen($prefix->Prefix) - $prefix_length - 1);
-            if (strlen($marker) > 0) {
-              $this->dir[] = $marker;
+          // Folders.
+          if (isset($response->body->CommonPrefixes)) {
+            foreach ($response->body->CommonPrefixes as $prefix) {
+              $marker = substr($prefix->Prefix, $prefix_length, strlen($prefix->Prefix) - $prefix_length - 1);
+              if (strlen($marker) > 0) {
+                $this->dir[] = $marker;
+              }
             }
           }
-        }
 
-        // Files.
-        if (isset($response->body->Contents)) {
-          $contents = $response->body->to_stdClass()->Contents;
-          if (!is_array($contents)) {
-            $contents = array($contents);
-          }
+          // Files.
+          if (isset($response->body->Contents)) {
+            $contents = $response->body->to_stdClass()->Contents;
+            if (!is_array($contents)) {
+              $contents = array($contents);
+            }
 
-          foreach ($contents as $content) {
-            $key = $content->Key;
-            if (substr_compare($key, '/', -1, 1) !== 0) {
-              $marker = basename($key);
-              $this->dir[] = $marker;
+            foreach ($contents as $content) {
+              $key = $content->Key;
+              if (substr_compare($key, '/', -1, 1) !== 0) {
+                $marker = basename($key);
+                $this->dir[] = $marker;
+              }
             }
           }
-        }
 
-        if (!isset($response->body->IsTruncated) || $response->body->IsTruncated === 'false') {
-          $truncated = FALSE;
+          if (!isset($response->body->IsTruncated) || $response->body->IsTruncated->__toString() === 'false') {
+            $truncated = FALSE;
+          }
+        }
+        else {
+          return FALSE;
         }
       }
-      else {
+      catch (Exception $e) {
+        watchdog('amazons3', 'Unable to open directory @path', array('@path' => $prefix), WATCHDOG_NOTICE);
         return FALSE;
       }
     }
+
     return TRUE;
   }
 
@@ -1121,12 +1195,18 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
       if (strlen($path) === 0) {
         return TRUE;
       }
-      $response = $this->getS3()->list_objects($this->bucket, array(
+
+      try {
+        $response = $this->getS3()->list_objects($this->bucket, array(
           'prefix' => $path . '/',
           'max-keys' => 1,
         ));
-      if ($response && isset($response->body->Contents->Key)) {
-        return TRUE;
+        if ($response && isset($response->body->Contents->Key)) {
+          return TRUE;
+        }
+      }
+      catch (Exception $e) {
+        watchdog('amazons3', 'Unable to check directory status of @path', array('@path' => $path), WATCHDOG_NOTICE);
       }
     }
     return FALSE;
@@ -1171,19 +1251,34 @@ class AmazonS3StreamWrapper implements DrupalStreamWrapperInterface {
       $metadata = $this->_amazons3_format_response($uri, array(), TRUE);
     }
     else {
-      $response = $this->getS3()->get_object_metadata($this->bucket, $this->getLocalPath($uri));
-      if ($response) {
-        $metadata = $this->_amazons3_format_response($uri, $response);
+      try {
+        $response = $this->getS3()
+          ->get_object_metadata($this->bucket, $this->getLocalPath($uri));
+        if ($response) {
+          $metadata = $this->_amazons3_format_response($uri, $response);
+        }
+      }
+      catch (Exception $e) {
+        watchdog('amazons3', 'Unable to get metadata for @uri', array('@uri' => $uri), WATCHDOG_NOTICE);
       }
     }
     if (is_array($metadata)) {
-      // Save to the cache.
-      db_merge('amazons3_file')
-        ->key(array('uri' => $metadata['uri']))
-        ->fields($metadata)
-        ->execute();
+      // Avoid any potential integrity constraint violations caused by another
+      // process inserting the entry during the db_merge.
+      try {
+        // Save to the cache.
+        db_merge('amazons3_file')
+          ->key(array('uri' => $metadata['uri']))
+          ->fields($metadata)
+          ->execute();
+      }
+      catch (Exception $e) {
+        // If it fails we don't care, the entry is either already written or will
+        // happen again on the next request.
+      }
       return $metadata;
     }
+
     return FALSE;
   }
 
